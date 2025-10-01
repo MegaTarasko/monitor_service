@@ -10,14 +10,20 @@ import json
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-# Настройки
-BOT_TOKEN = "7468846572:AAHjndmkLtP5xdvdVg3QhlAdGXZvuupjEuI"
+#хранение токенов
+from dotenv import load_dotenv
+#Загрузка токена
+load_dotenv()
+token = os.getenv('TOKEN')
+admin_id = os.getenv('ADMIN_ID')
+#Настройки
+BOT_TOKEN = token
 
 # Настройка логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# logging.basicConfig(
+#     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+#     level=logging.INFO
+# )
 logger = logging.getLogger(__name__)
 
 # Временное хранилище для данных пользователей
@@ -27,15 +33,7 @@ user_data = {}
 SUPPORTED_PLATFORMS = {
     'vk.com': 'VK Video',
     'vkvideo.ru': 'VK Video',
-    'vimeo.com': 'Vimeo',
-    'dailymotion.com': 'Dailymotion',
-    'instagram.com': 'Instagram',
-    'twitter.com': 'Twitter',
-    'x.com': 'Twitter',
-    'tiktok.com': 'TikTok',
-    'rutube.ru': 'Rutube',
-    'twitch.tv': 'Twitch',
-    'bilibili.com': 'Bilibili'
+    'rutube.ru': 'Rutube'
 }
 
 
@@ -115,7 +113,6 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ Эта платформа не поддерживается\n\n"
             "📹 Используйте команду /platforms чтобы увидеть список поддерживаемых платформ.\n\n"
-            "⚠️ YouTube временно не поддерживается из-за технических ограничений."
         )
         return
 
@@ -204,28 +201,48 @@ async def download_video(user_id: int, url: str, quality: str, context: ContextT
         user_dir = f"/home/taras/video_downloads/user_{user_id}"
         os.makedirs(user_dir, exist_ok=True)
 
-        # Настройки качества
-        quality_settings = {
-            'best': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]',
-            '720': 'bestvideo[height<=720]+bestaudio/best[height<=720]',
-            '480': 'bestvideo[height<=480]+bestaudio/best[height<=480]',
-            'audio': 'bestaudio/best'
+        # ИСПРАВЛЕННЫЕ настройки качества
+        quality_presets = {
+            'best': {
+                'format': 'best[height<=1080]/best',
+                'description': 'Лучшее качество (до 1080p)'
+            },
+            '720': {
+                'format': 'best[height<=720]/best',
+                'description': 'HD качество (720p)'
+            },
+            '480': {
+                'format': 'best[height<=480]/best',
+                'description': 'Стандартное качество (480p)'
+            },
+            'audio': {
+                'format': 'bestaudio/best',
+                'description': 'Только аудио',
+                'audio_params': ['-x', '--audio-format', 'mp3', '--audio-quality', '5']
+            }
         }
 
-        format_selection = quality_settings.get(quality, 'best')
+        preset = quality_presets.get(quality, quality_presets['best'])
+        format_selection = preset['format']
 
-        # Команда для yt-dlp с улучшенными параметрами
+        # Базовые параметры
         cmd = [
             "yt-dlp",
             "-o", f"{user_dir}/%(title)s.%(ext)s",
             "-f", format_selection,
             "--no-warnings",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "--retries", "5",
-            "--fragment-retries", "5",
+            "--retries", "3",
+            "--fragment-retries", "3",
             "--socket-timeout", "30",
             url
         ]
+
+        # Добавляем параметры для аудио если нужно
+        if quality == 'audio' and 'audio_params' in preset:
+            cmd.extend(preset['audio_params'])
+
+        logger.info(f"Скачивание с параметрами: {' '.join(cmd)}")
 
         # Выполняем скачивание
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -259,7 +276,7 @@ async def download_video(user_id: int, url: str, quality: str, context: ContextT
                     text=f"✅ Видео успешно скачано!\n\n"
                          f"📹 Файл: `{file_name}`\n"
                          f"📊 Размер: {file_size:.2f} MB\n"
-                         f"💾 Качество: {quality}\n\n"
+                         f"💾 Качество: {preset['description']}\n\n"
                          f"Выберите действие:",
                     reply_markup=reply_markup,
                     parse_mode='Markdown'
@@ -610,14 +627,6 @@ async def send_as_document(query, context, user_id, file_path):
     try:
         file_size = os.path.getsize(file_path) / (1024 * 1024)
 
-        # if file_size > 45:
-        #     await query.edit_message_text(
-        #         f"❌ Файл слишком большой даже для отправки как документ ({file_size:.1f} MB)\n\n"
-        #         f"💡 Максимальный размер: 50 MB\n"
-        #         f"Пожалуйста, разделите файл на части."
-        #     )
-        #     return
-
         with open(file_path, 'rb') as file:
             await context.bot.send_document(
                 chat_id=user_id,
@@ -860,7 +869,7 @@ async def handle_move_action(query, context, user_id, file_path):
     try:
         # Создаем папку пользователя
         username = user_data[user_id].get('username', f'user_{user_id}')
-        user_saved_dir = f"/home/taras/saved_videos/{username}"
+        user_saved_dir = f"/home/torrent/download/youtube/{username}"
         os.makedirs(user_saved_dir, exist_ok=True)
 
         # Перемещаем файл в папку пользователя
@@ -979,7 +988,7 @@ async def cleanup_old_files():
                     logger.error(f"Ошибка очистки {user_path}: {e}")
 
     # Также очищаем старые части файлов в saved_videos
-    saved_base = "/home/taras/saved_videos"
+    saved_base = "/home/torrent/download/youtube"
     if os.path.exists(saved_base):
         for item in os.listdir(saved_base):
             item_path = os.path.join(saved_base, item)
@@ -1004,7 +1013,7 @@ def main():
     """Запуск бота"""
     # Создаем базовые папки
     os.makedirs("/home/taras/video_downloads", exist_ok=True)
-    os.makedirs("/home/taras/saved_videos", exist_ok=True)
+    os.makedirs("/home/torrent/download/youtube", exist_ok=True)
 
     # Проверяем наличие ffmpeg и ffprobe
     try:
