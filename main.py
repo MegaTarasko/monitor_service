@@ -300,12 +300,12 @@ async def download_video(user_id: int, url: str, quality: str, context: ContextT
                 text=error_message
             )
 
-    except subprocess.TimeoutExpired:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="❌ Таймаут скачивания (10 минут)\n\n"
-                 "Возможно, видео слишком большое или платформа ограничивает скачивание."
-        )
+    # except subprocess.TimeoutExpired:
+    #     await context.bot.send_message(
+    #         chat_id=user_id,
+    #         text="❌ Таймаут скачивания (10 минут)\n\n"
+    #              "Возможно, видео слишком большое или платформа ограничивает скачивание."
+    #     )
     except Exception as e:
         await context.bot.send_message(
             chat_id=user_id,
