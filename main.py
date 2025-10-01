@@ -42,8 +42,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Бот для скачивания видео\n\n"
         "📹 Поддерживаемые платформы:\n"
-        "• VK Video\n• Vimeo\n• Dailymotion\n• Instagram\n• Twitter\n• TikTok\n"
-        "• Rutube\n• Twitch\n• Bilibili\n\n"
+        "• VK Video\n"
+        "• Rutube\n\n"
         "💾 Автоматическая оптимизация видео\n"
         "🎬 Отправка как видео с встроенным плеером\n"
         "🔄 Сжатие больших файлов\n\n"
