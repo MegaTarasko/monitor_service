@@ -204,15 +204,15 @@ async def download_video(user_id: int, url: str, quality: str, context: ContextT
         # ИСПРАВЛЕННЫЕ настройки качества
         quality_presets = {
             'best': {
-                'format': 'best[height<=1080]/best',
+                'format': 'res:1080,fps',
                 'description': 'Лучшее качество (до 1080p)'
             },
             '720': {
-                'format': 'best[height<=720]/best',
+                'format': 'res:720,fps',
                 'description': 'HD качество (720p)'
             },
             '480': {
-                'format': 'best[height<=480]/best',
+                'format': 'res:480,fps',
                 'description': 'Стандартное качество (480p)'
             },
             'audio': {
@@ -229,7 +229,8 @@ async def download_video(user_id: int, url: str, quality: str, context: ContextT
         cmd = [
             "yt-dlp",
             "-o", f"{user_dir}/%(title)s.%(ext)s",
-            "-f", format_selection,
+            "-S", format_selection,
+            "-f mp4",
             "--no-warnings",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "--retries", "3",
