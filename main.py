@@ -18,6 +18,15 @@ token = os.getenv('TOKEN')
 admin_id = os.getenv('ADMIN_ID')
 #Настройки
 BOT_TOKEN = token
+# ========== НАСТРОЙКИ ПРОКСИ ==========
+PROXY_HOST = os.getenv('PROXY_HOST')
+PROXY_PORT = os.getenv('PROXY_PORT')
+PROXY_USER = os.getenv('PROXY_USER')
+PROXY_PASS = os.getenv('PROXY_PASS')
+PROXY_PORT = int(PROXY_PORT)
+# Формируем URL прокси с аутентификацией
+PROXY_URL = f'http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}'
+# ======================================
 
 # Настройка логирования
 # logging.basicConfig(
