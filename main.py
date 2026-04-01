@@ -10,14 +10,16 @@ import json
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-#хранение токенов
+# хранение токенов
 from dotenv import load_dotenv
-#Загрузка токена
+
+# Загрузка токена
 load_dotenv()
 token = os.getenv('TOKEN')
 admin_id = os.getenv('ADMIN_ID')
-#Настройки
+# Настройки
 BOT_TOKEN = token
+
 # ========== НАСТРОЙКИ ПРОКСИ ==========
 PROXY_HOST = os.getenv('PROXY_HOST')
 PROXY_PORT = os.getenv('PROXY_PORT')
@@ -26,6 +28,10 @@ PROXY_PASS = os.getenv('PROXY_PASS')
 PROXY_PORT = int(PROXY_PORT)
 # Формируем URL прокси с аутентификацией
 PROXY_URL = f'http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}'
+
+# Устанавливаем прокси через переменные окружения
+os.environ['HTTP_PROXY'] = PROXY_URL
+os.environ['HTTPS_PROXY'] = PROXY_URL
 # ======================================
 
 # Настройка логирования
@@ -310,12 +316,6 @@ async def download_video(user_id: int, url: str, quality: str, context: ContextT
                 text=error_message
             )
 
-    # except subprocess.TimeoutExpired:
-    #     await context.bot.send_message(
-    #         chat_id=user_id,
-    #         text="❌ Таймаут скачивания (10 минут)\n\n"
-    #              "Возможно, видео слишком большое или платформа ограничивает скачивание."
-    #     )
     except Exception as e:
         await context.bot.send_message(
             chat_id=user_id,
@@ -483,7 +483,7 @@ async def handle_send_action(query, context, user_id, file_path):
         # Оптимизируем видео
         optimized_path = await optimize_video_for_telegram(file_path)
         optimized_size = os.path.getsize(optimized_path) / (
-                    1024 * 1024) if optimized_path != file_path else original_size
+                1024 * 1024) if optimized_path != file_path else original_size
 
         if optimized_path != file_path:
             await query.edit_message_text(
