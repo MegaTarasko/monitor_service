@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
+"""
+Telegram-бот для скачивания видео с VK Video и Rutube.
+
+Использует python-telegram-bot (Bot API) с поддержкой SOCKS5 / SOCKS4 /
+HTTP / HTTPS прокси. MTProto прокси Bot API не поддерживает принципиально
+(это ограничение Telegram, а не библиотеки).
+
+Ключевые исправления относительно исходной версии:
+  1. Прокси передаётся правильно — через HTTPXRequest(proxy=...), а не
+     через os.environ['HTTP_PROXY'] (тот хак в async httpx не работал).
+  2. Очистка старых файлов вынесена в post_init — больше не ломает event loop
+     (раньше asyncio.run(cleanup_old_files()) закрывал loop перед стартом).
+  3. schedule_file_deletion использует существующее Application вместо того,
+     чтобы создавать новое на каждый файл (утечка + потенциальные ошибки).
+  4. subprocess.run обёрнут в asyncio.to_thread — долгие вызовы yt-dlp/ffmpeg
+     больше не блокируют event loop, бот остаётся отзывчивым.
+  5. Таймауты httpx увеличены — через прокси дефолтных не хватает.
+  6. Прокси пробрасывается и в yt-dlp — раньше он ходил напрямую, мимо прокси.
+"""
+
 import os
+import sys
 import logging
 import subprocess
 import shutil
@@ -7,38 +28,100 @@ import asyncio
 import time
 import math
 import json
+from typing import Optional
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    CallbackQueryHandler,
+)
+from telegram.request import HTTPXRequest
 
-#хранение токенов
 from dotenv import load_dotenv
-#Загрузка токена
-load_dotenv()
-token = os.getenv('TOKEN')
-admin_id = os.getenv('ADMIN_ID')
-#Настройки
-BOT_TOKEN = token
 
-# Настройка логирования
-# logging.basicConfig(
-#     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-#     level=logging.INFO
-# )
+
+# ============================================================================
+# Конфигурация
+# ============================================================================
+load_dotenv()
+
+BOT_TOKEN = os.getenv("TOKEN", "").strip()
+ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
+
+if not BOT_TOKEN:
+    sys.exit("В .env не задан TOKEN")
+
+# ---------- ПРОКСИ ----------
+# PROXY_TYPE: socks5 | socks4 | http | https. По умолчанию socks5.
+# Если PROXY_HOST пустой — прокси не используется.
+PROXY_TYPE = os.getenv("PROXY_TYPE", "socks5").strip().lower()
+PROXY_HOST = os.getenv("PROXY_HOST", "").strip()
+PROXY_PORT_RAW = os.getenv("PROXY_PORT", "").strip()
+PROXY_USER = os.getenv("PROXY_USER", "").strip()
+PROXY_PASS = os.getenv("PROXY_PASS", "").strip()
+
+PROXY_URL: Optional[str] = None
+if PROXY_HOST and PROXY_PORT_RAW:
+    try:
+        _proxy_port = int(PROXY_PORT_RAW)
+    except ValueError:
+        sys.exit(f"PROXY_PORT должен быть числом, получено: {PROXY_PORT_RAW!r}")
+
+    if PROXY_TYPE not in ("socks5", "socks4", "http", "https"):
+        sys.exit(
+            f"PROXY_TYPE должен быть одним из: socks5, socks4, http, https. "
+            f"Получено: {PROXY_TYPE!r}"
+        )
+
+    if PROXY_USER and PROXY_PASS:
+        PROXY_URL = f"{PROXY_TYPE}://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{_proxy_port}"
+    else:
+        PROXY_URL = f"{PROXY_TYPE}://{PROXY_HOST}:{_proxy_port}"
+
+
+# ============================================================================
+# Логирование
+# ============================================================================
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Временное хранилище для данных пользователей
-user_data = {}
+if PROXY_URL:
+    safe_url = PROXY_URL.replace(PROXY_PASS, "***") if PROXY_PASS else PROXY_URL
+    logger.info("Прокси включён: %s", safe_url)
+else:
+    logger.info("Прокси не используется (прямое подключение)")
 
-# Поддерживаемые платформы
+
+# ============================================================================
+# Константы и состояние
+# ============================================================================
+user_data: dict = {}
+
 SUPPORTED_PLATFORMS = {
-    'vk.com': 'VK Video',
-    'vkvideo.ru': 'VK Video',
-    'rutube.ru': 'Rutube'
+    "vk.com": "VK Video",
+    "vkvideo.ru": "VK Video",
+    "rutube.ru": "Rutube",
 }
 
+DOWNLOAD_BASE = "/home/taras/video_downloads"
+SAVED_BASE = "/home/torrent/download/youtube"
+TELEGRAM_SIZE_LIMIT_MB = 45  # Запас от реального ~50MB у Bot API
 
+
+# ============================================================================
+# Команды
+# ============================================================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
     await update.message.reply_text(
         "🤖 Бот для скачивания видео\n\n"
         "📹 Поддерживаемые платформы:\n"
@@ -52,9 +135,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /help"""
-    platforms_list = "\n".join([f"• {name}" for name in SUPPORTED_PLATFORMS.values()])
-
+    platforms_list = "\n".join(f"• {name}" for name in SUPPORTED_PLATFORMS.values())
     await update.message.reply_text(
         f"📖 Как использовать бота:\n\n"
         f"1. Отправьте ссылку на видео\n"
@@ -72,9 +153,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def platforms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для показа поддерживаемых платформ"""
-    platforms_list = "\n".join([f"• {name}" for name in sorted(set(SUPPORTED_PLATFORMS.values()))])
-
+    platforms_list = "\n".join(
+        f"• {name}" for name in sorted(set(SUPPORTED_PLATFORMS.values()))
+    )
     await update.message.reply_text(
         f"📹 Поддерживаемые платформы:\n\n{platforms_list}\n\n"
         f"🔗 Просто отправьте ссылку с любой из этих платформ!\n\n"
@@ -82,106 +163,104 @@ async def platforms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ============================================================================
+# Утилиты
+# ============================================================================
 def is_supported_platform(url: str) -> bool:
-    """Проверяет поддерживается ли платформа"""
-    return any(domain in url for domain in SUPPORTED_PLATFORMS.keys())
+    return any(domain in url for domain in SUPPORTED_PLATFORMS)
 
 
 def get_platform_name(url: str) -> str:
-    """Возвращает название платформы по URL"""
     for domain, name in SUPPORTED_PLATFORMS.items():
         if domain in url:
             return name
     return "Неизвестная платформа"
 
 
+def normalize_url(url: str) -> str:
+    if "vkvideo.ru" in url:
+        url = url.replace("vkvideo.ru", "vk.com")
+    if "x.com" in url:
+        url = url.replace("x.com", "twitter.com")
+    return url
+
+
+async def run_subprocess(cmd: list, timeout: int = 600) -> subprocess.CompletedProcess:
+    """Не блокирует event loop — критично для долгих yt-dlp/ffmpeg."""
+    return await asyncio.to_thread(
+        subprocess.run, cmd, capture_output=True, text=True, timeout=timeout
+    )
+
+
+# ============================================================================
+# Обработка ссылок
+# ============================================================================
 async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик ссылок на видео"""
     url = update.message.text.strip()
     user_id = update.message.from_user.id
     username = update.message.from_user.username or f"user_{user_id}"
 
-    logger.info(f"User {user_id} ({username}) requested: {url}")
+    logger.info("User %s (%s) requested: %s", user_id, username, url)
 
-    # Проверяем, что это ссылка
-    if not url.startswith(('http://', 'https://')):
+    if not url.startswith(("http://", "https://")):
         await update.message.reply_text("❌ Это не похоже на ссылку. Отправьте корректный URL.")
         return
 
-    # Проверяем поддержку платформы
     if not is_supported_platform(url):
         await update.message.reply_text(
             "❌ Эта платформа не поддерживается\n\n"
-            "📹 Используйте команду /platforms чтобы увидеть список поддерживаемых платформ.\n\n"
+            "📹 Используйте команду /platforms чтобы увидеть список поддерживаемых платформ.\n"
         )
         return
 
-    # Автоматические замены URL для лучшей совместимости
     url = normalize_url(url)
 
-    # Сохраняем URL для пользователя
     user_data[user_id] = {
-        'url': url,
-        'step': 'quality_selection',
-        'platform': get_platform_name(url),
-        'username': username
+        "url": url,
+        "step": "quality_selection",
+        "platform": get_platform_name(url),
+        "username": username,
     }
 
-    # Предлагаем выбрать качество
     keyboard = [
         [
             InlineKeyboardButton("🎥 Лучшее качество", callback_data="quality_best"),
-            InlineKeyboardButton("⚖️ Сбалансированное", callback_data="quality_720")
+            InlineKeyboardButton("⚖️ Сбалансированное", callback_data="quality_720"),
         ],
         [
             InlineKeyboardButton("📱 Для телефона (480p)", callback_data="quality_480"),
-            InlineKeyboardButton("🎵 Только аудио", callback_data="quality_audio")
-        ]
+            InlineKeyboardButton("🎵 Только аудио", callback_data="quality_audio"),
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    platform_name = get_platform_name(url)
     await update.message.reply_text(
-        f"🎬 Ссылка с {platform_name} принята!\nВыберите качество видео:",
-        reply_markup=reply_markup
+        f"🎬 Ссылка с {get_platform_name(url)} принята!\nВыберите качество видео:",
+        reply_markup=reply_markup,
     )
 
 
-def normalize_url(url: str) -> str:
-    """Нормализует URL для лучшей совместимости"""
-    # Заменяем vkvideo.ru на vk.com
-    if 'vkvideo.ru' in url:
-        url = url.replace('vkvideo.ru', 'vk.com')
-
-    # Заменяем x.com на twitter.com
-    if 'x.com' in url:
-        url = url.replace('x.com', 'twitter.com')
-
-    return url
-
-
 async def handle_quality_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик выбора качества"""
     query = update.callback_query
     await query.answer()
 
     user_id = query.from_user.id
-    quality = query.data.replace('quality_', '')
+    quality = query.data.replace("quality_", "")
 
     if user_id not in user_data:
         await query.edit_message_text("❌ Сессия устарела. Отправьте ссылку заново.")
         return
 
-    url = user_data[user_id]['url']
-    platform = user_data[user_id]['platform']
-    user_data[user_id]['quality'] = quality
-    user_data[user_id]['step'] = 'downloading'
+    url = user_data[user_id]["url"]
+    platform = user_data[user_id]["platform"]
+    user_data[user_id]["quality"] = quality
+    user_data[user_id]["step"] = "downloading"
 
     quality_names = {
-        'best': 'лучшее качество',
-        '720': '720p (HD)',
-        '480': '480p',
-        'audio': 'только аудио'
+        "best": "лучшее качество",
+        "720": "720p (HD)",
+        "480": "480p",
+        "audio": "только аудио",
     }
 
     await query.edit_message_text(
@@ -190,85 +269,74 @@ async def handle_quality_selection(update: Update, context: ContextTypes.DEFAULT
         f"⏳ Это может занять несколько минут..."
     )
 
-    # Запускаем скачивание
     asyncio.create_task(download_video(user_id, url, quality, context))
 
 
+# ============================================================================
+# Скачивание
+# ============================================================================
 async def download_video(user_id: int, url: str, quality: str, context: ContextTypes.DEFAULT_TYPE):
-    """Скачивание видео в фоновом режиме"""
     try:
-        # Создаем папку для пользователя
-        user_dir = f"/home/taras/video_downloads/user_{user_id}"
+        user_dir = f"{DOWNLOAD_BASE}/user_{user_id}"
         os.makedirs(user_dir, exist_ok=True)
 
-        # ИСПРАВЛЕННЫЕ настройки качества
         quality_presets = {
-            'best': {
-                'format': 'res:1080,fps',
-                'description': 'Лучшее качество (до 1080p)'
+            "best":  {"format": "res:1080,fps", "description": "Лучшее качество (до 1080p)"},
+            "720":   {"format": "res:720,fps",  "description": "HD качество (720p)"},
+            "480":   {"format": "res:480,fps",  "description": "Стандартное качество (480p)"},
+            "audio": {
+                "format": "bestaudio/best",
+                "description": "Только аудио",
+                "audio_params": ["-x", "--audio-format", "mp3", "--audio-quality", "5"],
             },
-            '720': {
-                'format': 'res:720,fps',
-                'description': 'HD качество (720p)'
-            },
-            '480': {
-                'format': 'res:480,fps',
-                'description': 'Стандартное качество (480p)'
-            },
-            'audio': {
-                'format': 'bestaudio/best',
-                'description': 'Только аудио',
-                'audio_params': ['-x', '--audio-format', 'mp3', '--audio-quality', '5']
-            }
         }
 
-        preset = quality_presets.get(quality, quality_presets['best'])
-        format_selection = preset['format']
+        preset = quality_presets.get(quality, quality_presets["best"])
 
-        # Базовые параметры
         cmd = [
             "yt-dlp",
             "-o", f"{user_dir}/%(title)s.%(ext)s",
-            "-S", format_selection,
-            "-f mp4",
+            "-S", preset["format"],
+            "-f", "mp4",
             "--no-warnings",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "--retries", "3",
             "--fragment-retries", "3",
             "--socket-timeout", "30",
-            url
         ]
 
-        # Добавляем параметры для аудио если нужно
-        if quality == 'audio' and 'audio_params' in preset:
-            cmd.extend(preset['audio_params'])
+        # Прокси и для yt-dlp тоже — иначе он будет ходить напрямую
+        if PROXY_URL:
+            cmd.extend(["--proxy", PROXY_URL])
 
-        logger.info(f"Скачивание с параметрами: {' '.join(cmd)}")
+        if quality == "audio" and "audio_params" in preset:
+            cmd.extend(preset["audio_params"])
 
-        # Выполняем скачивание
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        cmd.append(url)
+
+        logger.info("yt-dlp: %s", " ".join(cmd))
+        result = await run_subprocess(cmd, timeout=600)
 
         if result.returncode == 0:
-            # Ищем скачанный файл
             files = os.listdir(user_dir)
             if files:
-                latest_file = max([os.path.join(user_dir, f) for f in files], key=os.path.getctime)
+                latest_file = max(
+                    (os.path.join(user_dir, f) for f in files),
+                    key=os.path.getctime,
+                )
 
-                user_data[user_id]['file_path'] = latest_file
-                user_data[user_id]['step'] = 'downloaded'
+                user_data[user_id]["file_path"] = latest_file
+                user_data[user_id]["step"] = "downloaded"
 
                 file_size = os.path.getsize(latest_file) / (1024 * 1024)
                 file_name = os.path.basename(latest_file)
 
-                # Клавиатура действий после скачивания
                 keyboard = [
                     [
                         InlineKeyboardButton("🎬 Отправить видео", callback_data="action_send"),
-                        InlineKeyboardButton("📁 Сохранить на сервере", callback_data="action_move")
+                        InlineKeyboardButton("📁 Сохранить на сервере", callback_data="action_move"),
                     ],
-                    [
-                        InlineKeyboardButton("🗑️ Удалить файл", callback_data="action_delete")
-                    ]
+                    [InlineKeyboardButton("🗑️ Удалить файл", callback_data="action_delete")],
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -280,270 +348,219 @@ async def download_video(user_id: int, url: str, quality: str, context: ContextT
                          f"💾 Качество: {preset['description']}\n\n"
                          f"Выберите действие:",
                     reply_markup=reply_markup,
-                    parse_mode='Markdown'
+                    parse_mode="Markdown",
                 )
 
-                # Запланировать автоматическое удаление через 1 час
-                asyncio.create_task(schedule_file_deletion(user_id, latest_file, 3600))
+                asyncio.create_task(
+                    schedule_file_deletion(user_id, latest_file, 3600, context.application)
+                )
             else:
                 await context.bot.send_message(
-                    chat_id=user_id,
-                    text="❌ Файл не найден после скачивания"
+                    chat_id=user_id, text="❌ Файл не найден после скачивания"
                 )
         else:
-            error_msg = result.stderr if result.stderr else "Неизвестная ошибка"
+            error_msg = result.stderr or "Неизвестная ошибка"
+            error_message = parse_error_message(error_msg, user_data[user_id]["platform"])
+            await context.bot.send_message(chat_id=user_id, text=error_message)
 
-            # Улучшенная обработка ошибок
-            error_message = await parse_error_message(error_msg, user_data[user_id]['platform'])
-
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=error_message
-            )
-
-    # except subprocess.TimeoutExpired:
-    #     await context.bot.send_message(
-    #         chat_id=user_id,
-    #         text="❌ Таймаут скачивания (10 минут)\n\n"
-    #              "Возможно, видео слишком большое или платформа ограничивает скачивание."
-    #     )
     except Exception as e:
+        logger.exception("Ошибка при скачивании")
         await context.bot.send_message(
             chat_id=user_id,
             text=f"❌ Неожиданная ошибка:\n`{str(e)}`\n\n"
                  "Попробуйте другую ссылку или повторите позже.",
-            parse_mode='Markdown'
+            parse_mode="Markdown",
         )
 
 
-async def parse_error_message(error: str, platform: str) -> str:
-    """Парсит и форматирует сообщения об ошибках"""
+def parse_error_message(error: str, platform: str) -> str:
     error_lower = error.lower()
-
     if "private" in error_lower or "login" in error_lower:
         return f"❌ Видео с {platform} приватное или требует авторизации\n\nДля скачивания нужен доступ к аккаунту."
-
-    elif "geo" in error_lower or "region" in error_lower or "country" in error_lower:
+    if "geo" in error_lower or "region" in error_lower or "country" in error_lower:
         return f"❌ Видео с {platform} недоступно в вашем регионе\n\nИспользуйте VPN или попробуйте другое видео."
-
-    elif "removed" in error_lower or "deleted" in error_lower or "unavailable" in error_lower:
+    if "removed" in error_lower or "deleted" in error_lower or "unavailable" in error_lower:
         return f"❌ Видео с {platform} было удалено или недоступно"
-
-    elif "too large" in error_lower or "size" in error_lower:
+    if "too large" in error_lower or "size" in error_lower:
         return "❌ Файл слишком большой для скачивания\n\nПопробуйте выбрать меньшее качество."
-
-    else:
-        return f"❌ Ошибка скачивания с {platform}:\n`{error[:500]}`\n\nПопробуйте другую ссылку."
+    return f"❌ Ошибка скачивания с {platform}:\n`{error[:500]}`\n\nПопробуйте другую ссылку."
 
 
+# ============================================================================
+# Оптимизация
+# ============================================================================
 async def optimize_video_for_telegram(input_path: str, output_path: str = None) -> str:
-    """
-    Оптимизирует видео для отправки в Telegram:
-    - Сжимает до 720p
-    - Уменьшает битрейт
-    - Конвертирует в оптимальный формат
-    - Удаляет метаданные
-    """
     if output_path is None:
         output_path = f"{input_path}_optimized.mp4"
 
     try:
-        # Получаем информацию о исходном видео
         probe_cmd = [
             "ffprobe", "-v", "quiet", "-print_format", "json",
-            "-show_format", "-show_streams", input_path
+            "-show_format", "-show_streams", input_path,
         ]
-
-        result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        result = await run_subprocess(probe_cmd, timeout=60)
         video_info = json.loads(result.stdout)
 
-        # Находим видео поток
-        video_stream = next((s for s in video_info['streams'] if s['codec_type'] == 'video'), None)
-
+        video_stream = next(
+            (s for s in video_info["streams"] if s["codec_type"] == "video"), None
+        )
         if not video_stream:
-            return input_path  # Не смогли проанализировать, возвращаем оригинал
-
-        original_height = int(video_stream.get('height', 1080))
-        original_bitrate = int(video_info['format'].get('bit_rate', 0)) / 1000  # kbps
-
-        # Настройки оптимизации для Telegram
-        target_height = min(720, original_height)  # Максимум 720p
-        target_bitrate = "2000k"  # Целевой битрейт
-        max_bitrate = "2500k"  # Максимальный битрейт
-        buffer_size = "5000k"  # Размер буфера
-
-        # Если оригинальное видео уже меньше наших целевых параметров, не оптимизируем
-        if original_height <= 720 and (original_bitrate <= 2500 or original_bitrate == 0):
-            logger.info("Видео уже оптимизировано, пропускаем сжатие")
             return input_path
 
-        logger.info(f"Оптимизируем видео: {original_height}p -> {target_height}p, битрейт ~{target_bitrate}")
+        original_height = int(video_stream.get("height", 1080))
+        original_bitrate = int(video_info["format"].get("bit_rate", 0)) / 1000
 
-        # Команда для оптимизации
+        target_height = min(720, original_height)
+        max_bitrate = "2500k"
+        buffer_size = "5000k"
+
+        if original_height <= 720 and (original_bitrate <= 2500 or original_bitrate == 0):
+            logger.info("Видео уже оптимизировано")
+            return input_path
+
+        logger.info("Оптимизируем: %sp → %sp", original_height, target_height)
+
         cmd = [
             "ffmpeg", "-i", input_path,
-            "-c:v", "libx264",  # Кодек H.264
-            "-preset", "medium",  # Баланс скорость/качество
-            "-crf", "23",  # Качество (23 - хороший баланс)
-            "-maxrate", max_bitrate,  # Максимальный битрейт
-            "-bufsize", buffer_size,  # Размер буфера
-            "-vf", f"scale=-2:{target_height}",  # Масштабирование по высоте
-            "-c:a", "aac",  # Аудио кодек
-            "-b:a", "128k",  # Аудио битрейт
-            "-ac", "2",  # Стерео звук
-            "-movflags", "+faststart",  # Быстрый старт для стриминга
-            "-map_metadata", "-1",  # Удаляем метаданные
-            "-y",  # Перезаписать выходной файл
-            output_path
+            "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+            "-maxrate", max_bitrate, "-bufsize", buffer_size,
+            "-vf", f"scale=-2:{target_height}",
+            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+            "-movflags", "+faststart",
+            "-map_metadata", "-1",
+            "-y", output_path,
         ]
-
-        # Выполняем оптимизацию
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = await run_subprocess(cmd, timeout=600)
 
         if result.returncode == 0 and os.path.exists(output_path):
             original_size = os.path.getsize(input_path) / (1024 * 1024)
             optimized_size = os.path.getsize(output_path) / (1024 * 1024)
-            compression_ratio = (1 - optimized_size / original_size) * 100
-
+            ratio = (1 - optimized_size / original_size) * 100
             logger.info(
-                f"Оптимизация завершена: {original_size:.1f}MB -> {optimized_size:.1f}MB ({compression_ratio:.1f}% сжатия)")
-
-            # Если оптимизированный файл стал больше, возвращаем оригинал
+                "Оптимизация: %.1fMB → %.1fMB (%.1f%%)",
+                original_size, optimized_size, ratio,
+            )
             if optimized_size >= original_size:
                 os.remove(output_path)
                 return input_path
-
             return output_path
-        else:
-            logger.error(f"Ошибка оптимизации: {result.stderr}")
-            return input_path
+
+        logger.error("Ошибка ffmpeg: %s", result.stderr)
+        return input_path
 
     except Exception as e:
-        logger.error(f"Ошибка при оптимизации видео: {e}")
+        logger.exception("Ошибка оптимизации: %s", e)
         return input_path
 
 
-async def create_thumbnail(video_path: str) -> str:
-    """Создает миниатюру для видео"""
+async def create_thumbnail(video_path: str) -> Optional[str]:
     try:
         thumbnail_path = f"{video_path}_thumb.jpg"
-
         cmd = [
             "ffmpeg", "-i", video_path,
-            "-ss", "00:00:05",  # Берем кадр на 5-й секунде
-            "-vframes", "1",  # Только один кадр
-            "-q:v", "2",  # Качество JPEG
-            thumbnail_path
+            "-ss", "00:00:05", "-vframes", "1", "-q:v", "2",
+            thumbnail_path,
         ]
-
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = await run_subprocess(cmd, timeout=30)
 
         if result.returncode == 0 and os.path.exists(thumbnail_path):
-            # Проверяем размер миниатюры (Telegram limit 200KB)
-            thumb_size = os.path.getsize(thumbnail_path) / 1024  # KB
-            if thumb_size > 190:  # Оставляем запас
-                # Уменьшаем качество
-                cmd_compress = [
-                    "ffmpeg", "-i", thumbnail_path,
-                    "-q:v", "5",  # Более сильное сжатие
-                    f"{thumbnail_path}_compressed.jpg"
-                ]
-                subprocess.run(cmd_compress, capture_output=True, timeout=10)
-                os.replace(f"{thumbnail_path}_compressed.jpg", thumbnail_path)
-
+            thumb_size = os.path.getsize(thumbnail_path) / 1024
+            if thumb_size > 190:
+                compressed = f"{thumbnail_path}_compressed.jpg"
+                await run_subprocess(
+                    ["ffmpeg", "-i", thumbnail_path, "-q:v", "5", compressed], timeout=10
+                )
+                if os.path.exists(compressed):
+                    os.replace(compressed, thumbnail_path)
             return thumbnail_path
-
     except Exception as e:
-        logger.error(f"Ошибка создания миниатюры: {e}")
-
+        logger.error("Ошибка миниатюры: %s", e)
     return None
 
 
+# ============================================================================
+# Отправка
+# ============================================================================
 async def handle_send_action(query, context, user_id, file_path):
-    """Обработка отправки файла как видео с оптимизацией"""
+    original_size = 0
     try:
-        original_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+        original_size = os.path.getsize(file_path) / (1024 * 1024)
 
-        # Реальные лимиты Telegram для ботов
-        if original_size > 45:
+        if original_size > TELEGRAM_SIZE_LIMIT_MB:
             await handle_large_file(query, context, user_id, file_path, original_size)
             return
 
         await query.edit_message_text("🔄 Оптимизирую видео для Telegram...")
 
-        # Оптимизируем видео
         optimized_path = await optimize_video_for_telegram(file_path)
-        optimized_size = os.path.getsize(optimized_path) / (
-                    1024 * 1024) if optimized_path != file_path else original_size
+        optimized_size = (
+            os.path.getsize(optimized_path) / (1024 * 1024)
+            if optimized_path != file_path
+            else original_size
+        )
 
         if optimized_path != file_path:
             await query.edit_message_text(
-                f"✅ Видео оптимизировано: {original_size:.1f}MB → {optimized_size:.1f}MB\n🎬 Отправляю...")
+                f"✅ Видео оптимизировано: {original_size:.1f}MB → {optimized_size:.1f}MB\n🎬 Отправляю..."
+            )
 
-        # Создаем миниатюру
         thumbnail_path = await create_thumbnail(optimized_path)
 
         try:
-            # Пытаемся отправить как видео
-            with open(optimized_path, 'rb') as video_file:
+            with open(optimized_path, "rb") as video_file:
                 await context.bot.send_video(
                     chat_id=user_id,
                     video=video_file,
                     caption=f"📹 {os.path.basename(file_path)}\n"
-                            f"📊 {optimized_size:.1f} MB{' (оптимизировано)' if optimized_path != file_path else ''}",
+                            f"📊 {optimized_size:.1f} MB"
+                            f"{' (оптимизировано)' if optimized_path != file_path else ''}",
                     thumbnail=thumbnail_path,
                     supports_streaming=True,
-                    read_timeout=60,
-                    write_timeout=60,
-                    connect_timeout=60
+                    read_timeout=120,
+                    write_timeout=120,
+                    connect_timeout=60,
                 )
 
             success_message = "✅ Видео успешно отправлено!"
             if optimized_path != file_path:
-                compression_ratio = (1 - optimized_size / original_size) * 100
-                success_message += f"\n💾 Сжатие: {original_size:.1f}MB → {optimized_size:.1f}MB ({compression_ratio:.1f}%)"
-
+                ratio = (1 - optimized_size / original_size) * 100
+                success_message += (
+                    f"\n💾 Сжатие: {original_size:.1f}MB → {optimized_size:.1f}MB ({ratio:.1f}%)"
+                )
             await query.edit_message_text(success_message)
 
         except Exception as send_error:
-            # Если не получилось как видео, пробуем как документ
             error_msg = str(send_error)
             if "413" in error_msg or "Request Entity Too Large" in error_msg or "400" in error_msg:
                 await query.edit_message_text("🔄 Видео слишком большое, пробую отправить как файл...")
                 await send_as_document(query, context, user_id, optimized_path)
             else:
-                raise send_error
+                raise
 
         finally:
-            # Удаляем временные файлы
             if thumbnail_path and os.path.exists(thumbnail_path):
                 os.remove(thumbnail_path)
             if optimized_path != file_path and os.path.exists(optimized_path):
-                os.remove(optimized_path)  # Удаляем оптимизированную копию
+                os.remove(optimized_path)
             if os.path.exists(file_path):
-                os.remove(file_path)  # Удаляем оригинал
-            if user_id in user_data:
-                del user_data[user_id]
+                os.remove(file_path)
+            user_data.pop(user_id, None)
 
     except Exception as e:
         await handle_send_error(query, e, original_size)
 
 
 async def handle_large_file(query, context, user_id, file_path, file_size):
-    """Обработка больших файлов"""
-    # Предлагаем варианты для больших файлов
     keyboard = [
         [
             InlineKeyboardButton("🔄 Оптимизировать и отправить", callback_data=f"optimize_{user_id}"),
-            InlineKeyboardButton("✂️ Разделить на части", callback_data=f"split_{user_id}")
+            InlineKeyboardButton("✂️ Разделить на части", callback_data=f"split_{user_id}"),
         ],
         [
             InlineKeyboardButton("📁 Сохранить на сервере", callback_data="action_move"),
-            InlineKeyboardButton("📤 Отправить как есть", callback_data="action_send_as_file")
+            InlineKeyboardButton("📤 Отправить как есть", callback_data="action_send_as_file"),
         ],
-        [
-            InlineKeyboardButton("🗑️ Удалить файл", callback_data="action_delete")
-        ]
+        [InlineKeyboardButton("🗑️ Удалить файл", callback_data="action_delete")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -556,22 +573,21 @@ async def handle_large_file(query, context, user_id, file_path, file_size):
         f"• 📁 Сохранить на сервере\n"
         f"• 📤 Отправить как файл\n"
         f"• 🗑️ Удалить",
-        reply_markup=reply_markup
+        reply_markup=reply_markup,
     )
 
 
 async def handle_optimize_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик оптимизации файла"""
     query = update.callback_query
     await query.answer()
 
     user_id = query.from_user.id
 
-    if user_id not in user_data or 'file_path' not in user_data[user_id]:
+    if user_id not in user_data or "file_path" not in user_data[user_id]:
         await query.edit_message_text("❌ Файл не найден или сессия устарела.")
         return
 
-    file_path = user_data[user_id]['file_path']
+    file_path = user_data[user_id]["file_path"]
     original_size = os.path.getsize(file_path) / (1024 * 1024)
 
     await query.edit_message_text(
@@ -581,83 +597,71 @@ async def handle_optimize_action(update: Update, context: ContextTypes.DEFAULT_T
     )
 
     try:
-        # Оптимизируем видео
         optimized_path = await optimize_video_for_telegram(file_path)
         optimized_size = os.path.getsize(optimized_path) / (1024 * 1024)
 
         if optimized_path == file_path:
-            await query.edit_message_text(
-                "ℹ️ Видео уже оптимального размера\n"
-                "Пробую отправить как есть..."
-            )
+            await query.edit_message_text("ℹ️ Видео уже оптимального размера\nПробую отправить как есть...")
             await handle_send_action(query, context, user_id, file_path)
             return
 
-        compression_ratio = (1 - optimized_size / original_size) * 100
+        ratio = (1 - optimized_size / original_size) * 100
+        user_data[user_id]["file_path"] = optimized_path
 
-        # Обновляем путь к файлу в данных пользователя
-        user_data[user_id]['file_path'] = optimized_path
-
-        if optimized_size <= 45:
+        if optimized_size <= TELEGRAM_SIZE_LIMIT_MB:
             await query.edit_message_text(
                 f"✅ Оптимизация завершена!\n"
-                f"💾 Сжатие: {original_size:.1f}MB → {optimized_size:.1f}MB ({compression_ratio:.1f}%)\n"
+                f"💾 Сжатие: {original_size:.1f}MB → {optimized_size:.1f}MB ({ratio:.1f}%)\n"
                 f"🎬 Отправляю видео..."
             )
             await handle_send_action(query, context, user_id, optimized_path)
         else:
             await query.edit_message_text(
                 f"✅ Оптимизация завершена!\n"
-                f"💾 Сжатие: {original_size:.1f}MB → {optimized_size:.1f}MB ({compression_ratio:.1f}%)\n"
-                f"📊 Размер все еще большой: {optimized_size:.1f}MB\n\n"
+                f"💾 Сжатие: {original_size:.1f}MB → {optimized_size:.1f}MB ({ratio:.1f}%)\n"
+                f"📊 Размер всё ещё большой: {optimized_size:.1f}MB\n\n"
                 f"💡 Выберите действие:"
             )
-            # Показываем обновленные варианты
             await handle_large_file(query, context, user_id, optimized_path, optimized_size)
 
     except Exception as e:
         await query.edit_message_text(
-            f"❌ Ошибка при оптимизации:\n`{str(e)}`\n\n"
-            f"💡 Попробуйте другой способ.",
-            parse_mode='Markdown'
+            f"❌ Ошибка при оптимизации:\n`{str(e)}`\n\n💡 Попробуйте другой способ.",
+            parse_mode="Markdown",
         )
 
 
 async def send_as_document(query, context, user_id, file_path):
-    """Отправляет файл как документ"""
     try:
         file_size = os.path.getsize(file_path) / (1024 * 1024)
-
-        with open(file_path, 'rb') as file:
+        with open(file_path, "rb") as file:
             await context.bot.send_document(
                 chat_id=user_id,
                 document=file,
                 filename=os.path.basename(file_path),
-                caption=f"📁 {os.path.basename(file_path)}\n📊 {file_size:.1f} MB"
+                caption=f"📁 {os.path.basename(file_path)}\n📊 {file_size:.1f} MB",
+                read_timeout=120,
+                write_timeout=120,
+                connect_timeout=60,
             )
-
         await query.edit_message_text("✅ Файл успешно отправлен!")
 
-        # Удаляем файл после успешной отправки
         try:
             os.remove(file_path)
-            if user_id in user_data:
-                del user_data[user_id]
-        except:
+        except OSError:
             pass
+        user_data.pop(user_id, None)
 
     except Exception as e:
         await query.edit_message_text(f"❌ Ошибка отправки как файл: {str(e)}")
 
 
 async def handle_send_as_file_action(query, context, user_id, file_path):
-    """Обработка отправки как файла"""
     await query.edit_message_text("📤 Отправляю как файл...")
     await send_as_document(query, context, user_id, file_path)
 
 
 async def handle_send_error(query, error, file_size):
-    """Обработка ошибок отправки"""
     error_msg = str(error)
     if "413" in error_msg or "Request Entity Too Large" in error_msg:
         await query.edit_message_text(
@@ -673,68 +677,57 @@ async def handle_send_error(query, error, file_size):
         await query.edit_message_text(f"❌ Ошибка отправки: {str(error)}")
 
 
-async def split_large_file(file_path: str, max_size_mb: int = 45):
-    """Разделяет большой файл на части используя ffmpeg"""
+# ============================================================================
+# Разделение файлов
+# ============================================================================
+async def split_large_file(file_path: str, max_size_mb: int = TELEGRAM_SIZE_LIMIT_MB):
     try:
-        file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+        file_size = os.path.getsize(file_path) / (1024 * 1024)
         if file_size <= max_size_mb:
-            return [file_path]  # Не нужно разделять
+            return [file_path]
 
-        # Создаем папку для частей
         base_name = os.path.splitext(file_path)[0]
         parts_dir = f"{base_name}_parts"
         os.makedirs(parts_dir, exist_ok=True)
 
-        # Получаем длительность видео
         duration_cmd = [
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", file_path
+            "-of", "default=noprint_wrappers=1:nokey=1", file_path,
         ]
-
-        result = subprocess.run(duration_cmd, capture_output=True, text=True)
+        result = await run_subprocess(duration_cmd, timeout=60)
         total_duration = float(result.stdout.strip())
 
-        # Вычисляем количество частей
-        num_parts = max(2, math.ceil(file_size / max_size_mb))  # Минимум 2 части
+        num_parts = max(2, math.ceil(file_size / max_size_mb))
         part_duration = total_duration / num_parts
 
         part_files = []
-
         for i in range(num_parts):
             part_file = f"{parts_dir}/part_{i + 1:02d}.mp4"
             start_time = i * part_duration
 
-            # Сначала пробуем скопировать без перекодирования
             cmd = [
                 "ffmpeg", "-i", file_path,
-                "-ss", str(start_time),
-                "-t", str(part_duration),
-                "-c", "copy",  # Копируем без перекодирования
-                "-avoid_negative_ts", "make_zero",
-                part_file
+                "-ss", str(start_time), "-t", str(part_duration),
+                "-c", "copy", "-avoid_negative_ts", "make_zero",
+                part_file,
             ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            result = await run_subprocess(cmd, timeout=300)
 
             if result.returncode == 0 and os.path.exists(part_file):
                 part_size = os.path.getsize(part_file) / (1024 * 1024)
-
-                # Если часть все еще слишком большая, уменьшаем качество
                 if part_size > max_size_mb:
                     os.remove(part_file)
                     cmd = [
                         "ffmpeg", "-i", file_path,
-                        "-ss", str(start_time),
-                        "-t", str(part_duration),
-                        "-vf", "scale=854:480",  # Уменьшаем разрешение до 480p
-                        "-c:v", "libx264", "-crf", "28",  # Более сильное сжатие
+                        "-ss", str(start_time), "-t", str(part_duration),
+                        "-vf", "scale=854:480",
+                        "-c:v", "libx264", "-crf", "28",
                         "-c:a", "aac", "-b:a", "96k",
                         "-preset", "fast",
-                        part_file
+                        part_file,
                     ]
-                    subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                    await run_subprocess(cmd, timeout=300)
 
-                # Проверяем финальный размер
                 if os.path.exists(part_file):
                     final_size = os.path.getsize(part_file) / (1024 * 1024)
                     if final_size <= max_size_mb:
@@ -745,23 +738,18 @@ async def split_large_file(file_path: str, max_size_mb: int = 45):
         return part_files if part_files else [file_path]
 
     except Exception as e:
-        logger.error(f"Ошибка разделения файла: {e}")
+        logger.exception("Ошибка разделения: %s", e)
         return [file_path]
 
 
 async def send_video_parts(chat_id, part_files, context, original_filename):
-    """Отправляет части видео в Telegram"""
     total_parts = len(part_files)
-
     for i, part_file in enumerate(part_files):
         try:
             part_size = os.path.getsize(part_file) / (1024 * 1024)
-            part_name = f"{original_filename}.part{i + 1:02d}.mp4"
-
-            # Создаем миниатюру для части
             thumbnail_path = await create_thumbnail(part_file)
 
-            with open(part_file, 'rb') as video_file:
+            with open(part_file, "rb") as video_file:
                 await context.bot.send_video(
                     chat_id=chat_id,
                     video=video_file,
@@ -770,35 +758,32 @@ async def send_video_parts(chat_id, part_files, context, original_filename):
                             f"📊 {part_size:.1f} MB",
                     thumbnail=thumbnail_path,
                     supports_streaming=True,
-                    read_timeout=60,
-                    write_timeout=60,
-                    connect_timeout=60
+                    read_timeout=120,
+                    write_timeout=120,
+                    connect_timeout=60,
                 )
 
-            # Удаляем временные файлы
             if thumbnail_path and os.path.exists(thumbnail_path):
                 os.remove(thumbnail_path)
             os.remove(part_file)
 
         except Exception as e:
-            logger.error(f"Ошибка отправки части {i + 1}: {e}")
+            logger.error("Ошибка отправки части %s: %s", i + 1, e)
             return False
-
     return True
 
 
 async def handle_split_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик разделения файла на части"""
     query = update.callback_query
     await query.answer()
 
     user_id = query.from_user.id
 
-    if user_id not in user_data or 'file_path' not in user_data[user_id]:
+    if user_id not in user_data or "file_path" not in user_data[user_id]:
         await query.edit_message_text("❌ Файл не найден или сессия устарела.")
         return
 
-    file_path = user_data[user_id]['file_path']
+    file_path = user_data[user_id]["file_path"]
     original_filename = os.path.basename(file_path)
     file_size = os.path.getsize(file_path) / (1024 * 1024)
 
@@ -810,8 +795,7 @@ async def handle_split_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
     try:
-        # Разделяем файл на части
-        part_files = await split_large_file(file_path, max_size_mb=45)
+        part_files = await split_large_file(file_path, max_size_mb=TELEGRAM_SIZE_LIMIT_MB)
 
         if len(part_files) <= 1:
             await query.edit_message_text(
@@ -822,20 +806,15 @@ async def handle_split_action(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
-        # Отправляем части как видео
         await query.edit_message_text(
-            f"📤 Отправляю {len(part_files)} частей...\n"
-            f"⏳ Пожалуйста, подождите..."
+            f"📤 Отправляю {len(part_files)} частей...\n⏳ Пожалуйста, подождите..."
         )
 
         success = await send_video_parts(user_id, part_files, context, original_filename)
 
         if success:
-            # Удаляем исходный файл
             if os.path.exists(file_path):
                 os.remove(file_path)
-
-            # Удаляем папку с частями если она пустая
             parts_dir = f"{os.path.splitext(file_path)[0]}_parts"
             if os.path.exists(parts_dir) and not os.listdir(parts_dir):
                 os.rmdir(parts_dir)
@@ -843,8 +822,7 @@ async def handle_split_action(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.edit_message_text(
                 f"✅ Все части успешно отправлены!\n\n"
                 f"📦 Отправлено частей: {len(part_files)}\n"
-                f"🎬 Все части отправлены как видео\n"
-                f"💡 Можно смотреть прямо в Telegram!"
+                f"🎬 Можно смотреть прямо в Telegram!"
             )
         else:
             await query.edit_message_text(
@@ -853,30 +831,26 @@ async def handle_split_action(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "Проверьте полученные сообщения."
             )
 
-        # Очищаем данные пользователя
-        if user_id in user_data:
-            del user_data[user_id]
+        user_data.pop(user_id, None)
 
     except Exception as e:
         await query.edit_message_text(
             f"❌ Ошибка при разделении видео:\n`{str(e)}`\n\n"
             f"💡 Попробуйте сохранить видео на сервере.",
-            parse_mode='Markdown'
+            parse_mode="Markdown",
         )
 
 
+# ============================================================================
+# Move / Delete
+# ============================================================================
 async def handle_move_action(query, context, user_id, file_path):
-    """Обработка перемещения файла в папку пользователя"""
     try:
-        # Создаем папку пользователя
-        username = user_data[user_id].get('username', f'user_{user_id}')
-        user_saved_dir = f"/home/torrent/download/youtube/{username}"
+        username = user_data[user_id].get("username", f"user_{user_id}")
+        user_saved_dir = f"{SAVED_BASE}/{username}"
         os.makedirs(user_saved_dir, exist_ok=True)
 
-        # Перемещаем файл в папку пользователя
         new_path = os.path.join(user_saved_dir, os.path.basename(file_path))
-
-        # Если файл с таким именем уже существует, добавляем суффикс
         counter = 1
         original_new_path = new_path
         while os.path.exists(new_path):
@@ -893,160 +867,168 @@ async def handle_move_action(query, context, user_id, file_path):
             f"📹 Файл: `{os.path.basename(new_path)}`\n"
             f"📊 Размер: {file_size:.1f} MB\n"
             f"📂 Путь: `{new_path}`",
-            parse_mode='Markdown'
+            parse_mode="Markdown",
         )
-        # Обновляем путь в данных пользователя
-        user_data[user_id]['file_path'] = new_path
+        user_data[user_id]["file_path"] = new_path
 
     except Exception as e:
         await query.edit_message_text(f"❌ Ошибка сохранения: {str(e)}")
 
 
 async def handle_delete_action(query, context, user_id, file_path):
-    """Обработка удаления файла"""
     try:
         if os.path.exists(file_path):
             os.remove(file_path)
             await query.edit_message_text("✅ Видео удалено с сервера")
         else:
-            await query.edit_message_text("✅ Файл уже удален")
-
-        # Очищаем данные пользователя
-        if user_id in user_data:
-            del user_data[user_id]
+            await query.edit_message_text("✅ Файл уже удалён")
+        user_data.pop(user_id, None)
     except Exception as e:
         await query.edit_message_text(f"❌ Ошибка удаления: {str(e)}")
 
 
 async def handle_post_download_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик действий после скачивания"""
     query = update.callback_query
     await query.answer()
 
     user_id = query.from_user.id
 
-    # Обработка специальных действий
-    if query.data.startswith('split_'):
+    if query.data.startswith("split_"):
         await handle_split_action(update, context)
         return
-    elif query.data.startswith('optimize_'):
+    if query.data.startswith("optimize_"):
         await handle_optimize_action(update, context)
         return
 
-    action = query.data.replace('action_', '')
+    action = query.data.replace("action_", "")
 
-    if user_id not in user_data or 'file_path' not in user_data[user_id]:
+    if user_id not in user_data or "file_path" not in user_data[user_id]:
         await query.edit_message_text("❌ Файл не найден или сессия устарела.")
         return
 
-    file_path = user_data[user_id]['file_path']
+    file_path = user_data[user_id]["file_path"]
 
-    if action == 'send':
+    if action == "send":
         await handle_send_action(query, context, user_id, file_path)
-    elif action == 'send_as_file':
+    elif action == "send_as_file":
         await handle_send_as_file_action(query, context, user_id, file_path)
-    elif action == 'move':
+    elif action == "move":
         await handle_move_action(query, context, user_id, file_path)
-    elif action == 'delete':
+    elif action == "delete":
         await handle_delete_action(query, context, user_id, file_path)
 
 
-async def schedule_file_deletion(user_id: int, file_path: str, delay: int):
-    """Планирует автоматическое удаление файла"""
+# ============================================================================
+# Фоновые задачи
+# ============================================================================
+async def schedule_file_deletion(
+    user_id: int, file_path: str, delay: int, application: Application
+):
+    """Автоудаление через delay секунд. Использует переданное Application — не создаём новое!"""
     await asyncio.sleep(delay)
-
     try:
         if os.path.exists(file_path):
             os.remove(file_path)
-            logger.info(f"Автоматически удален файл: {file_path}")
+            logger.info("Автоудалён файл: %s", file_path)
 
-            # Уведомляем пользователя если сессия активна
-            if user_id in user_data and user_data[user_id].get('file_path') == file_path:
+            if user_id in user_data and user_data[user_id].get("file_path") == file_path:
                 try:
-                    await Application.builder().token(BOT_TOKEN).build().bot.send_message(
+                    await application.bot.send_message(
                         chat_id=user_id,
-                        text="🗑️ Файл автоматически удален с сервера (через 1 час)"
+                        text="🗑️ Файл автоматически удалён с сервера (через 1 час)",
                     )
-                except:
-                    pass
+                except Exception as notify_err:
+                    logger.warning("Не удалось уведомить: %s", notify_err)
     except Exception as e:
-        logger.error(f"Ошибка автоматического удаления: {e}")
+        logger.error("Ошибка автоудаления: %s", e)
 
 
 async def cleanup_old_files():
-    """Очистка старых файлов при запуске"""
-    download_base = "/home/taras/video_downloads"
-    if os.path.exists(download_base):
-        for user_dir in os.listdir(download_base):
-            user_path = os.path.join(download_base, user_dir)
+    if os.path.exists(DOWNLOAD_BASE):
+        for user_dir in os.listdir(DOWNLOAD_BASE):
+            user_path = os.path.join(DOWNLOAD_BASE, user_dir)
             if os.path.isdir(user_path):
                 try:
-                    # Удаляем папки старше 2 часов
                     if os.path.getctime(user_path) < (time.time() - 7200):
                         shutil.rmtree(user_path)
-                        logger.info(f"Удалена старая папка: {user_path}")
+                        logger.info("Удалена старая папка: %s", user_path)
                 except Exception as e:
-                    logger.error(f"Ошибка очистки {user_path}: {e}")
+                    logger.error("Ошибка очистки %s: %s", user_path, e)
 
-    # Также очищаем старые части файлов в saved_videos
-    saved_base = "/home/torrent/download/youtube"
-    if os.path.exists(saved_base):
-        for item in os.listdir(saved_base):
-            item_path = os.path.join(saved_base, item)
+    if os.path.exists(SAVED_BASE):
+        for item in os.listdir(SAVED_BASE):
+            item_path = os.path.join(SAVED_BASE, item)
             try:
-                # Удаляем файлы/папки старше 7 дней
                 if os.path.getctime(item_path) < (time.time() - 604800):
                     if os.path.isdir(item_path):
                         shutil.rmtree(item_path)
                     else:
                         os.remove(item_path)
-                    logger.info(f"Удален старый файл: {item_path}")
+                    logger.info("Удалён старый файл: %s", item_path)
             except Exception as e:
-                logger.error(f"Ошибка очистки {item_path}: {e}")
+                logger.error("Ошибка очистки %s: %s", item_path, e)
 
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик ошибок"""
-    logger.error(f"Ошибка: {context.error}")
+async def on_startup(application: Application):
+    """Запускается после старта event loop — чистим старые файлы."""
+    await cleanup_old_files()
+    logger.info("Бот готов к работе")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Ошибка в хэндлере: %s", context.error, exc_info=context.error)
+
+
+# ============================================================================
+# Точка входа
+# ============================================================================
+def build_request() -> HTTPXRequest:
+    """HTTPXRequest с прокси и увеличенными таймаутами (через прокси нужно больше)."""
+    kwargs = {
+        "connect_timeout": 30.0,
+        "read_timeout": 60.0,
+        "write_timeout": 60.0,
+        "pool_timeout": 30.0,
+    }
+    if PROXY_URL:
+        kwargs["proxy"] = PROXY_URL
+    return HTTPXRequest(**kwargs)
 
 
 def main():
-    """Запуск бота"""
-    # Создаем базовые папки
-    os.makedirs("/home/taras/video_downloads", exist_ok=True)
-    os.makedirs("/home/torrent/download/youtube", exist_ok=True)
+    os.makedirs(DOWNLOAD_BASE, exist_ok=True)
+    os.makedirs(SAVED_BASE, exist_ok=True)
 
-    # Проверяем наличие ffmpeg и ffprobe
     try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True)
-        subprocess.run(["ffprobe", "-version"], capture_output=True)
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=False)
+        subprocess.run(["ffprobe", "-version"], capture_output=True, check=False)
         logger.info("FFmpeg и FFprobe доступны")
-    except:
-        logger.warning(
-            "FFmpeg или FFprobe не установлены. Установите их для работы с большими файлами: sudo apt install ffmpeg")
+    except FileNotFoundError:
+        logger.warning("FFmpeg/FFprobe не найдены. sudo apt install ffmpeg")
 
-    # Очищаем старые файлы
-    asyncio.run(cleanup_old_files())
+    # Два отдельных request — один для long polling, другой для обычных запросов
+    # (стандартная практика в ptb, чтобы опрос обновлений не конкурировал с заливкой файлов)
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .request(build_request())
+        .get_updates_request(build_request())
+        .post_init(on_startup)
+        .build()
+    )
 
-    try:
-        application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("platforms", platforms_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video_url))
+    application.add_handler(CallbackQueryHandler(handle_quality_selection, pattern="^quality_"))
+    application.add_handler(
+        CallbackQueryHandler(handle_post_download_actions, pattern="^(action_|split_|optimize_)")
+    )
+    application.add_error_handler(error_handler)
 
-        # Добавляем обработчики
-        application.add_handler(CommandHandler("start", start_command))
-        application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("platforms", platforms_command))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video_url))
-        application.add_handler(CallbackQueryHandler(handle_quality_selection, pattern="^quality_"))
-        application.add_handler(
-            CallbackQueryHandler(handle_post_download_actions, pattern="^(action_|split_|optimize_)"))
-
-        application.add_error_handler(error_handler)
-
-        logger.info("Бот запускается...")
-        application.run_polling()
-
-    except Exception as e:
-        logger.error(f"Ошибка запуска бота: {e}")
+    logger.info("Бот запускается...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
