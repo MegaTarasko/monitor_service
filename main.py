@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 """
-Telegram-бот для скачивания видео с VK Video и Rutube.
+Telegram-бот для скачивания видео.
 
-Использует python-telegram-bot (Bot API) с поддержкой SOCKS5 / SOCKS4 /
-HTTP / HTTPS прокси. MTProto прокси Bot API не поддерживает принципиально
-(это ограничение Telegram, а не библиотеки).
+Маршрутизация прокси (ключевое отличие этой версии):
+  • VK Video, Rutube                      → БЕЗ прокси (прямое подключение)
+  • YouTube, TikTok, Instagram, X/Twitter → ЧЕРЕЗ SOCKS5 прокси
 
-Ключевые исправления относительно исходной версии:
-  1. Прокси передаётся правильно — через HTTPXRequest(proxy=...), а не
-     через os.environ['HTTP_PROXY'] (тот хак в async httpx не работал).
-  2. Очистка старых файлов вынесена в post_init — больше не ломает event loop
-     (раньше asyncio.run(cleanup_old_files()) закрывал loop перед стартом).
-  3. schedule_file_deletion использует существующее Application вместо того,
-     чтобы создавать новое на каждый файл (утечка + потенциальные ошибки).
-  4. subprocess.run обёрнут в asyncio.to_thread — долгие вызовы yt-dlp/ffmpeg
-     больше не блокируют event loop, бот остаётся отзывчивым.
-  5. Таймауты httpx увеличены — через прокси дефолтных не хватает.
-  6. Прокси пробрасывается и в yt-dlp — раньше он ходил напрямую, мимо прокси.
+Логика: прокси подставляется в yt-dlp только для доменов из
+PROXIED_DOMAINS. Для NO_PROXY_DOMAINS yt-dlp вызывается без --proxy.
+Подключение самого бота к Telegram Bot API использует тот же прокси
+(это независимо от скачивания видео — Bot API из РФ обычно заблокирован).
+
+Про MTProto: Bot API его не поддерживает принципиально, а yt-dlp
+вообще не умеет MTProto (это протокол Telegram-клиентов). Для
+обхода блокировок YouTube из РФ нужен именно SOCKS5/HTTP(S).
 """
 
 import os
@@ -29,6 +26,7 @@ import time
 import math
 import json
 from typing import Optional
+from urllib.parse import urlparse
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -57,9 +55,11 @@ if not BOT_TOKEN:
     sys.exit("В .env не задан TOKEN")
 
 # ---------- ПРОКСИ ----------
-# PROXY_TYPE: socks5 | socks4 | http | https. По умолчанию socks5.
-# Если PROXY_HOST пустой — прокси не используется.
-PROXY_TYPE = os.getenv("PROXY_TYPE", "socks5").strip().lower()
+# PROXY_TYPE: socks5 | socks5h | socks4 | http | https. По умолчанию socks5h.
+# socks5h резолвит DNS на стороне прокси — важно для обхода блокировок,
+# иначе наш сервер сам пойдёт в заблокированный DNS и получит подменённый ответ.
+# Если PROXY_HOST пустой — прокси не используется нигде.
+PROXY_TYPE = os.getenv("PROXY_TYPE", "socks5h").strip().lower()
 PROXY_HOST = os.getenv("PROXY_HOST", "").strip()
 PROXY_PORT_RAW = os.getenv("PROXY_PORT", "").strip()
 PROXY_USER = os.getenv("PROXY_USER", "").strip()
@@ -72,9 +72,9 @@ if PROXY_HOST and PROXY_PORT_RAW:
     except ValueError:
         sys.exit(f"PROXY_PORT должен быть числом, получено: {PROXY_PORT_RAW!r}")
 
-    if PROXY_TYPE not in ("socks5", "socks4", "http", "https"):
+    if PROXY_TYPE not in ("socks5", "socks5h", "socks4", "http", "https"):
         sys.exit(
-            f"PROXY_TYPE должен быть одним из: socks5, socks4, http, https. "
+            f"PROXY_TYPE должен быть одним из: socks5, socks5h, socks4, http, https. "
             f"Получено: {PROXY_TYPE!r}"
         )
 
@@ -82,6 +82,174 @@ if PROXY_HOST and PROXY_PORT_RAW:
         PROXY_URL = f"{PROXY_TYPE}://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{_proxy_port}"
     else:
         PROXY_URL = f"{PROXY_TYPE}://{PROXY_HOST}:{_proxy_port}"
+
+
+# ============================================================================
+# МАРШРУТИЗАЦИЯ ПРОКСИ ПО ДОМЕНАМ
+# ============================================================================
+# ---- Списки доменов читаются из .env (вариант В) ----
+# Формат в .env: через запятую, пробелы допустимы, поддомены m./www./vm.
+# автоматически причисляются к базовому домену (см. _host_matches).
+#
+# Если переменная в .env не задана — используем дефолт.
+# Если задана пустой строкой (NO_PROXY_DOMAINS=) — список будет пустым.
+#
+# ВАЖНО: домены должны быть чистыми (без схемы и путей): правильно "vk.com",
+# неправильно "https://vk.com/". Некорректные записи отсеиваются с предупреждением.
+
+_DEFAULT_NO_PROXY = "vk.com,vkvideo.ru,vk.ru,rutube.ru,ok.ru"
+_DEFAULT_PROXIED = (
+    "youtube.com,youtu.be,music.youtube.com,"
+    "tiktok.com,instagram.com,twitter.com,x.com"
+)
+
+# Человекочитаемые названия для UI. Ключ — "канонический" домен
+# (тот, что в NO_PROXY_DOMAINS / PROXIED_DOMAINS). Поддомены наследуют имя
+# автоматически через get_platform_name.
+_DEFAULT_PLATFORM_NAMES = {
+    "vk.com": "VK Video",
+    "vkvideo.ru": "VK Video",
+    "vk.ru": "VK Video",
+    "rutube.ru": "Rutube",
+    "ok.ru": "Одноклассники",
+    "youtube.com": "YouTube",
+    "youtu.be": "YouTube",
+    "music.youtube.com": "YouTube Music",
+    "tiktok.com": "TikTok",
+    "instagram.com": "Instagram",
+    "twitter.com": "X (Twitter)",
+    "x.com": "X (Twitter)",
+    # Дополнительные — имя подхватится, если пользователь добавит домен в .env
+    "twitch.tv": "Twitch",
+    "vimeo.com": "Vimeo",
+    "dailymotion.com": "Dailymotion",
+    "facebook.com": "Facebook",
+    "fb.watch": "Facebook",
+    "reddit.com": "Reddit",
+    "soundcloud.com": "SoundCloud",
+    "bilibili.com": "Bilibili",
+}
+
+
+# ---- Хелперы для работы с доменами ----
+# Определены до парсинга списков, потому что _parse_domain_list их использует
+# для мягкой нормализации (если пользователь случайно вписал схему/путь).
+
+def extract_hostname(url: str) -> Optional[str]:
+    """Безопасно вытаскивает hostname, отбрасывая www. и порт."""
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return host or None
+    except Exception:
+        return None
+
+
+def _host_matches(host: str, domains: frozenset) -> bool:
+    """True, если host == d или host оканчивается на '.' + d для какого-то d.
+
+    Проверка через '.' + d критична: "fake-vk.com" НЕ должно матчить "vk.com",
+    а "m.vk.com" — должно.
+    """
+    for d in domains:
+        if host == d or host.endswith("." + d):
+            return True
+    return False
+
+
+def _parse_domain_list(raw: str, var_name: str) -> frozenset:
+    """Парсит 'a.com, b.com ,c.com' → frozenset{'a.com','b.com','c.com'}.
+
+    Отбрасывает пустые записи, приводит к lower-case, убирает ведущие 'www.'
+    и 'https://', логирует подозрительные записи.
+    """
+    result = set()
+    for raw_item in raw.split(","):
+        item = raw_item.strip().lower()
+        if not item:
+            continue
+        # Мягкая нормализация: если пользователь всё-таки вписал схему/путь —
+        # попробуем вытащить хост, а не ломать старт.
+        if "://" in item or "/" in item:
+            fixed = extract_hostname(item if "://" in item else f"http://{item}")
+            if fixed:
+                print(f"[config] {var_name}: '{item}' → '{fixed}' (нормализовано)")
+                item = fixed
+            else:
+                print(f"[config] {var_name}: пропускаю некорректную запись '{item}'")
+                continue
+        if item.startswith("www."):
+            item = item[4:]
+        # Базовая валидация: должна быть хотя бы одна точка и допустимые символы
+        if "." not in item or any(c.isspace() for c in item):
+            print(f"[config] {var_name}: пропускаю некорректную запись '{item}'")
+            continue
+        result.add(item)
+    return frozenset(result)
+
+
+NO_PROXY_DOMAINS = _parse_domain_list(
+    os.getenv("NO_PROXY_DOMAINS", _DEFAULT_NO_PROXY),
+    "NO_PROXY_DOMAINS",
+)
+PROXIED_DOMAINS = _parse_domain_list(
+    os.getenv("PROXIED_DOMAINS", _DEFAULT_PROXIED),
+    "PROXIED_DOMAINS",
+)
+
+# Защита от пересечения: если один и тот же домен случайно попал в оба списка,
+# NO_PROXY побеждает (принцип "без прокси — более консервативное поведение").
+_overlap = NO_PROXY_DOMAINS & PROXIED_DOMAINS
+if _overlap:
+    print(
+        f"[config] Домены есть и в NO_PROXY, и в PROXIED: {sorted(_overlap)}. "
+        f"Использую NO_PROXY (без прокси) для них."
+    )
+    PROXIED_DOMAINS = PROXIED_DOMAINS - _overlap
+
+# Итоговый словарь имён платформ — дефолты + пользовательские из .env,
+# если он вдруг захочет переопределить (редкий кейс, но пусть будет).
+PLATFORM_NAMES = dict(_DEFAULT_PLATFORM_NAMES)
+
+
+def is_supported_platform(url: str) -> bool:
+    host = extract_hostname(url)
+    if not host:
+        return False
+    return _host_matches(host, NO_PROXY_DOMAINS) or _host_matches(host, PROXIED_DOMAINS)
+
+
+def should_use_proxy(url: str) -> bool:
+    """Решает, использовать ли прокси для данного URL.
+
+    Правила:
+      1. Если PROXY_URL не настроен → никогда не используем прокси.
+      2. Если хост в NO_PROXY_DOMAINS (VK/Rutube) → напрямую.
+      3. Всё остальное (YouTube/TikTok/Instagram/X и прочее) → через прокси.
+    """
+    if not PROXY_URL:
+        return False
+    host = extract_hostname(url)
+    if not host:
+        return False  # Подозрительный URL — безопаснее не трогать прокси
+    if _host_matches(host, NO_PROXY_DOMAINS):
+        return False
+    return True
+
+
+def get_platform_name(url: str) -> str:
+    host = extract_hostname(url)
+    if not host:
+        return "Неизвестная платформа"
+    # Ищем наиболее специфичное совпадение (длинный домен бьёт короткий)
+    best = None
+    for d, name in PLATFORM_NAMES.items():
+        if host == d or host.endswith("." + d):
+            if best is None or len(d) > len(best[0]):
+                best = (d, name)
+    return best[1] if best else "Неизвестная платформа"
 
 
 # ============================================================================
@@ -97,21 +265,17 @@ logger = logging.getLogger(__name__)
 
 if PROXY_URL:
     safe_url = PROXY_URL.replace(PROXY_PASS, "***") if PROXY_PASS else PROXY_URL
-    logger.info("Прокси включён: %s", safe_url)
+    logger.info("Прокси настроен: %s", safe_url)
+    logger.info("Напрямую (без прокси): %s", ", ".join(sorted(NO_PROXY_DOMAINS)))
+    logger.info("Через прокси: %s (и всё остальное)", ", ".join(sorted(PROXIED_DOMAINS)))
 else:
-    logger.info("Прокси не используется (прямое подключение)")
+    logger.info("Прокси не настроен — все запросы идут напрямую")
 
 
 # ============================================================================
 # Константы и состояние
 # ============================================================================
 user_data: dict = {}
-
-SUPPORTED_PLATFORMS = {
-    "vk.com": "VK Video",
-    "vkvideo.ru": "VK Video",
-    "rutube.ru": "Rutube",
-}
 
 DOWNLOAD_BASE = "/home/taras/video_downloads"
 SAVED_BASE = "/home/torrent/download/youtube"
@@ -121,12 +285,39 @@ TELEGRAM_SIZE_LIMIT_MB = 45  # Запас от реального ~50MB у Bot A
 # ============================================================================
 # Команды
 # ============================================================================
+def _format_platform_groups() -> str:
+    """Формирует текст со списком платформ, разделённых по группам (через прокси / напрямую).
+
+    Использует PLATFORM_NAMES для человекочитаемого имени; если домена там нет,
+    показывает просто домен. Дедуплицирует имена (vk.com и vkvideo.ru → одна "VK Video").
+    """
+    def _group(domains):
+        labels = []
+        seen = set()
+        for d in sorted(domains):
+            name = PLATFORM_NAMES.get(d, d)
+            if name not in seen:
+                seen.add(name)
+                labels.append(name)
+        return labels
+
+    direct = _group(NO_PROXY_DOMAINS)
+    proxied = _group(PROXIED_DOMAINS)
+
+    parts = []
+    if direct:
+        parts.append("🔗 Напрямую (без прокси):\n" + "\n".join(f"• {n}" for n in direct))
+    if proxied:
+        label = "🛡 Через прокси:" if PROXY_URL else "🛡 Через прокси (⚠ прокси не настроен!):"
+        parts.append(label + "\n" + "\n".join(f"• {n}" for n in proxied))
+    return "\n\n".join(parts) if parts else "• (список пуст — проверьте .env)"
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Бот для скачивания видео\n\n"
-        "📹 Поддерживаемые платформы:\n"
-        "• VK Video\n"
-        "• Rutube\n\n"
+        "📹 Поддерживаемые платформы:\n\n"
+        f"{_format_platform_groups()}\n\n"
         "💾 Автоматическая оптимизация видео\n"
         "🎬 Отправка как видео с встроенным плеером\n"
         "🔄 Сжатие больших файлов\n\n"
@@ -135,53 +326,38 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    platforms_list = "\n".join(f"• {name}" for name in SUPPORTED_PLATFORMS.values())
     await update.message.reply_text(
         f"📖 Как использовать бота:\n\n"
         f"1. Отправьте ссылку на видео\n"
         f"2. Выберите качество\n"
         f"3. Дождитесь скачивания\n"
         f"4. После скачивания выберите действие\n\n"
-        f"📹 Поддерживаемые платформы:\n{platforms_list}\n\n"
+        f"📹 Поддерживаемые платформы:\n\n"
+        f"{_format_platform_groups()}\n\n"
         f"🎬 Видео отправляются с встроенным плеером\n"
         f"💾 Автоматическая оптимизация и сжатие\n"
         f"✂️ Разделение больших файлов на части\n"
         f"📁 Сохранение в личной папке пользователя\n"
-        f"⚠️ YouTube временно не поддерживается\n"
         f"🗑️ Файлы автоматически удаляются через 1 час"
     )
 
 
 async def platforms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    platforms_list = "\n".join(
-        f"• {name}" for name in sorted(set(SUPPORTED_PLATFORMS.values()))
-    )
     await update.message.reply_text(
-        f"📹 Поддерживаемые платформы:\n\n{platforms_list}\n\n"
-        f"🔗 Просто отправьте ссылку с любой из этих платформ!\n\n"
-        f"⚠️ YouTube временно не поддерживается"
+        f"📹 Поддерживаемые платформы:\n\n"
+        f"{_format_platform_groups()}\n\n"
+        f"🔗 Просто отправьте ссылку с любой из этих платформ!"
     )
 
 
 # ============================================================================
 # Утилиты
 # ============================================================================
-def is_supported_platform(url: str) -> bool:
-    return any(domain in url for domain in SUPPORTED_PLATFORMS)
-
-
-def get_platform_name(url: str) -> str:
-    for domain, name in SUPPORTED_PLATFORMS.items():
-        if domain in url:
-            return name
-    return "Неизвестная платформа"
-
-
 def normalize_url(url: str) -> str:
+    """Мягкие нормализации URL перед передачей в yt-dlp."""
+    # vkvideo.ru → vk.com (устаревший редирект, но оставим)
     if "vkvideo.ru" in url:
         url = url.replace("vkvideo.ru", "vk.com")
-    if "x.com" in url:
-        url = url.replace("x.com", "twitter.com")
     return url
 
 
@@ -209,16 +385,19 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_supported_platform(url):
         await update.message.reply_text(
             "❌ Эта платформа не поддерживается\n\n"
-            "📹 Используйте команду /platforms чтобы увидеть список поддерживаемых платформ.\n"
+            "📹 Используйте команду /platforms чтобы увидеть список поддерживаемых платформ."
         )
         return
 
     url = normalize_url(url)
+    platform = get_platform_name(url)
+    route = "через прокси" if should_use_proxy(url) else "напрямую"
+    logger.info("Маршрут для %s: %s", platform, route)
 
     user_data[user_id] = {
         "url": url,
         "step": "quality_selection",
-        "platform": get_platform_name(url),
+        "platform": platform,
         "username": username,
     }
 
@@ -235,7 +414,7 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        f"🎬 Ссылка с {get_platform_name(url)} принята!\nВыберите качество видео:",
+        f"🎬 Ссылка с {platform} принята! ({route})\nВыберите качество видео:",
         reply_markup=reply_markup,
     )
 
@@ -305,16 +484,29 @@ async def download_video(user_id: int, url: str, quality: str, context: ContextT
             "--socket-timeout", "30",
         ]
 
-        # Прокси и для yt-dlp тоже — иначе он будет ходить напрямую
-        if PROXY_URL:
+        # ★ Главное изменение: прокси подставляется ТОЛЬКО для доменов,
+        # требующих обхода блокировок. VK/Rutube идут напрямую.
+        use_proxy = should_use_proxy(url)
+        if use_proxy:
             cmd.extend(["--proxy", PROXY_URL])
+            logger.info("yt-dlp для %s: через прокси", url)
+        else:
+            # Явно отключаем прокси на случай, если где-то в окружении
+            # установлены HTTP_PROXY/HTTPS_PROXY — иначе yt-dlp может их подхватить.
+            cmd.extend(["--proxy", ""])
+            logger.info("yt-dlp для %s: напрямую", url)
 
         if quality == "audio" and "audio_params" in preset:
             cmd.extend(preset["audio_params"])
 
         cmd.append(url)
 
-        logger.info("yt-dlp: %s", " ".join(cmd))
+        # Логируем команду, маскируя пароль прокси
+        safe_cmd = " ".join(cmd)
+        if PROXY_PASS:
+            safe_cmd = safe_cmd.replace(PROXY_PASS, "***")
+        logger.info("yt-dlp: %s", safe_cmd)
+
         result = await run_subprocess(cmd, timeout=600)
 
         if result.returncode == 0:
@@ -360,7 +552,10 @@ async def download_video(user_id: int, url: str, quality: str, context: ContextT
                 )
         else:
             error_msg = result.stderr or "Неизвестная ошибка"
-            error_message = parse_error_message(error_msg, user_data[user_id]["platform"])
+            # Маскируем пароль прокси в тексте ошибки
+            if PROXY_PASS:
+                error_msg = error_msg.replace(PROXY_PASS, "***")
+            error_message = parse_error_message(error_msg, user_data[user_id]["platform"], use_proxy)
             await context.bot.send_message(chat_id=user_id, text=error_message)
 
     except Exception as e:
@@ -373,12 +568,25 @@ async def download_video(user_id: int, url: str, quality: str, context: ContextT
         )
 
 
-def parse_error_message(error: str, platform: str) -> str:
+def parse_error_message(error: str, platform: str, used_proxy: bool) -> str:
     error_lower = error.lower()
+    # Прокси-специфичные ошибки
+    if used_proxy and (
+        "socks" in error_lower
+        or "proxy" in error_lower
+        or "connection refused" in error_lower
+        or "unable to connect to proxy" in error_lower
+    ):
+        return (
+            f"❌ Проблема с прокси при скачивании с {platform}\n\n"
+            f"Прокси-сервер недоступен или отказал в соединении.\n"
+            f"Проверьте настройки PROXY_HOST/PROXY_PORT в .env.\n\n"
+            f"Детали:\n`{error[:400]}`"
+        )
     if "private" in error_lower or "login" in error_lower:
         return f"❌ Видео с {platform} приватное или требует авторизации\n\nДля скачивания нужен доступ к аккаунту."
     if "geo" in error_lower or "region" in error_lower or "country" in error_lower:
-        return f"❌ Видео с {platform} недоступно в вашем регионе\n\nИспользуйте VPN или попробуйте другое видео."
+        return f"❌ Видео с {platform} недоступно в вашем регионе"
     if "removed" in error_lower or "deleted" in error_lower or "unavailable" in error_lower:
         return f"❌ Видео с {platform} было удалено или недоступно"
     if "too large" in error_lower or "size" in error_lower:
@@ -924,7 +1132,7 @@ async def handle_post_download_actions(update: Update, context: ContextTypes.DEF
 async def schedule_file_deletion(
     user_id: int, file_path: str, delay: int, application: Application
 ):
-    """Автоудаление через delay секунд. Использует переданное Application — не создаём новое!"""
+    """Автоудаление через delay секунд."""
     await asyncio.sleep(delay)
     try:
         if os.path.exists(file_path):
@@ -983,7 +1191,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # Точка входа
 # ============================================================================
 def build_request() -> HTTPXRequest:
-    """HTTPXRequest с прокси и увеличенными таймаутами (через прокси нужно больше)."""
+    """HTTPXRequest для подключения бота к Telegram Bot API.
+
+    Прокси используется ТОЛЬКО здесь (для Bot API из РФ обычно обязателен).
+    Это не связано с маршрутизацией yt-dlp — там прокси применяется
+    отдельно, по доменам (см. should_use_proxy).
+    """
     kwargs = {
         "connect_timeout": 30.0,
         "read_timeout": 60.0,
@@ -1006,8 +1219,6 @@ def main():
     except FileNotFoundError:
         logger.warning("FFmpeg/FFprobe не найдены. sudo apt install ffmpeg")
 
-    # Два отдельных request — один для long polling, другой для обычных запросов
-    # (стандартная практика в ptb, чтобы опрос обновлений не конкурировал с заливкой файлов)
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
